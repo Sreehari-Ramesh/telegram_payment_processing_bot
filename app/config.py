@@ -6,8 +6,8 @@ load_dotenv()
 
 # Fallback defaults so the bot runs even on a server with no .env file present.
 # A real .env (or real server env vars) always takes precedence over these.
-DEFAULT_TELEGRAM_BOT_TOKEN = '8916015050:AAHEh8Ud4tykzu3VL8CnaZVsoXzvZCfRm6g'
-DEFAULT_MANAGER_TELEGRAM_IDS = '7507452703'
+DEFAULT_TELEGRAM_BOT_TOKEN = 'add your telegram bot token here'
+DEFAULT_MANAGER_TELEGRAM_IDS = 'add your manager id here'
 DEFAULT_DATABASE_URL = 'sqlite:///reminder_bot.db'
 DEFAULT_TIMEZONE = 'Asia/Dubai'
 DEFAULT_DAILY_SEND_TIME = '10:00'
