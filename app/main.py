@@ -2,9 +2,16 @@ import logging
 from datetime import time
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatType
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from app.config import get_settings
 from app.database import init_db
@@ -75,6 +82,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         '/send_custom <category> <message>             (one category)\n'
         '/send_custom <group_code> <message>            (one group)\n'
         '/send_custom <code1,code2,...> <message>  (specific groups)\n'
+        '/send_pick <message>                          (tap groups from a checklist)\n'
         '/confirm_send <code>\n'
         '/cancel_send <code>\n'
         '/status_today\n'
@@ -276,6 +284,185 @@ async def send_custom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await ask_confirmation(update, context, category, message_text=message_text, group_code=group_code)
+
+
+PICKER_PAGE_SIZE = 25
+
+
+def build_picker_markup(selected: set[str], page: int) -> tuple[InlineKeyboardMarkup, int, int]:
+    groups = get_groups(active_only=True)
+    total_pages = max(1, (len(groups) + PICKER_PAGE_SIZE - 1) // PICKER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PICKER_PAGE_SIZE
+    page_groups = groups[start:start + PICKER_PAGE_SIZE]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    for group in page_groups:
+        mark = '✅' if group.group_code in selected else '⬜'
+        rows.append([InlineKeyboardButton(
+            f'{mark} {group.group_code} ({group.category})',
+            callback_data=f'pk:t:{page}:{group.group_code}',
+        )])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton('◀ Prev', callback_data=f'pk:pg:{page - 1}'))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton('Next ▶', callback_data=f'pk:pg:{page + 1}'))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([
+        InlineKeyboardButton('Select all', callback_data=f'pk:all:{page}'),
+        InlineKeyboardButton('Clear all', callback_data=f'pk:clr:{page}'),
+    ])
+    rows.append([
+        InlineKeyboardButton(f'Continue ({len(selected)} selected) ▶', callback_data='pk:done'),
+        InlineKeyboardButton('Cancel', callback_data='pk:cancel'),
+    ])
+
+    return InlineKeyboardMarkup(rows), page, total_pages
+
+
+def picker_status_text(message_text: str, selected: set[str], page: int, total_pages: int) -> str:
+    return (
+        f'Select groups to send to (page {page + 1}/{total_pages}), {len(selected)} selected:\n\n'
+        f'{message_text}'
+    )
+
+
+async def send_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_manager(update):
+        return
+
+    message_text = command_payload(update)
+    if not message_text:
+        await update.message.reply_text(
+            'Use:\n/send_pick <message>\n\n'
+            'Example:\n/send_pick Reminder: please clear your dues.\n\n'
+            'You will get a checklist to tap the groups to send to, instead of typing codes.'
+        )
+        return
+
+    groups = get_groups(active_only=True)
+    if not groups:
+        await update.message.reply_text('No active groups registered yet.')
+        return
+
+    context.user_data['picker'] = {'message_text': message_text, 'selected': set()}
+    markup, page, total_pages = build_picker_markup(set(), 0)
+    await update.message.reply_text(
+        picker_status_text(message_text, set(), page, total_pages),
+        reply_markup=markup,
+    )
+
+
+async def picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+
+    if not is_authorized_manager(user.id if user else None):
+        await query.answer('You are not authorized to use this.', show_alert=True)
+        return
+
+    data = query.data or ''
+
+    if data.startswith('pk:confirm:'):
+        code = data[len('pk:confirm:'):]
+        pending = consume_confirmation(user.id, code)
+        if pending is None:
+            await query.answer('Invalid, expired, or already-used confirmation code.', show_alert=True)
+            return
+        target_label = format_target_label(pending.target_category, pending.target_group_code)
+        await query.answer('Sending...')
+        await query.edit_message_text(
+            f'Sending reminder to {target_label}. I will send you a summary after completion.'
+        )
+        context.application.create_task(
+            _send_and_report(
+                application=context.application,
+                chat_id=update.effective_chat.id,
+                category=pending.target_category,
+                message_text=pending.message_text,
+                sent_by=str(user.id),
+                group_code=pending.target_group_code,
+            )
+        )
+        return
+
+    if data.startswith('pk:cancelconfirm:'):
+        code = data[len('pk:cancelconfirm:'):]
+        consume_confirmation(user.id, code)
+        await query.answer('Cancelled.')
+        await query.edit_message_text('Send cancelled.')
+        return
+
+    picker = context.user_data.get('picker')
+    if picker is None:
+        await query.answer('This picker session has expired. Start again with /send_pick.', show_alert=True)
+        return
+
+    if data == 'pk:cancel':
+        context.user_data.pop('picker', None)
+        await query.answer('Cancelled.')
+        await query.edit_message_text('Send cancelled.')
+        return
+
+    if data == 'pk:done':
+        if not picker['selected']:
+            await query.answer('Select at least one group first.', show_alert=True)
+            return
+        group_code = ','.join(sorted(picker['selected']))
+        code, target_count = create_pending_confirmation(
+            user.id, None, picker['message_text'], group_code=group_code,
+        )
+        context.user_data.pop('picker', None)
+        target_label = format_target_label(None, group_code)
+        await query.answer()
+        await query.edit_message_text(
+            'Reminder Preview:\n\n'
+            f'{picker["message_text"]}\n\n'
+            f'Target: {target_label}\n'
+            f'Active groups: {target_count}\n\n'
+            'Tap to confirm or cancel (expires in 10 minutes):',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton('✅ Confirm & Send', callback_data=f'pk:confirm:{code}'),
+                InlineKeyboardButton('\U0001f6ab Cancel', callback_data=f'pk:cancelconfirm:{code}'),
+            ]]),
+        )
+        return
+
+    if data.startswith('pk:t:'):
+        page_str, _, code = data[len('pk:t:'):].partition(':')
+        page = int(page_str) if page_str.isdigit() else 0
+        if code in picker['selected']:
+            picker['selected'].discard(code)
+        else:
+            picker['selected'].add(code)
+        await query.answer()
+    elif data.startswith('pk:pg:'):
+        try:
+            page = int(data[len('pk:pg:'):])
+        except ValueError:
+            page = 0
+        await query.answer()
+    elif data.startswith('pk:all:'):
+        picker['selected'] = {g.group_code for g in get_groups(active_only=True)}
+        page = int(data[len('pk:all:'):]) if data[len('pk:all:'):].isdigit() else 0
+        await query.answer('All groups selected.')
+    elif data.startswith('pk:clr:'):
+        picker['selected'] = set()
+        page = int(data[len('pk:clr:'):]) if data[len('pk:clr:'):].isdigit() else 0
+        await query.answer('Selection cleared.')
+    else:
+        await query.answer()
+        return
+
+    markup, page, total_pages = build_picker_markup(picker['selected'], page)
+    await query.edit_message_text(
+        picker_status_text(picker['message_text'], picker['selected'], page, total_pages),
+        reply_markup=markup,
+    )
 
 
 async def _send_and_report(
@@ -521,10 +708,44 @@ def parse_daily_time(value: str) -> time:
         raise RuntimeError('DAILY_SEND_TIME must be in HH:MM format, e.g. 10:00') from exc
 
 
+PRIVATE_CHAT_COMMANDS = [
+    BotCommand('help', 'Show manager commands'),
+    BotCommand('preview_reminder', 'Preview reminder message'),
+    BotCommand('send_reminder_all', 'Send reminder to all active groups'),
+    BotCommand('send_reminder_b2b', 'Send reminder to B2B groups'),
+    BotCommand('send_reminder_b2c', 'Send reminder to B2C groups'),
+    BotCommand('send_reminder_powerplay', 'Send reminder to Powerplay groups'),
+    BotCommand('send_reminder_viking', 'Send reminder to Viking groups'),
+    BotCommand('send_custom', 'Send a custom message to all, a category, or specific groups'),
+    BotCommand('send_pick', 'Pick groups from a checklist to send a custom message'),
+    BotCommand('confirm_send', 'Confirm reminder broadcast'),
+    BotCommand('cancel_send', 'Cancel reminder broadcast'),
+    BotCommand('status_today', "Show today's send status"),
+    BotCommand('groups', 'List registered groups'),
+    BotCommand('pause_group', 'Pause a group'),
+    BotCommand('resume_group', 'Resume a group'),
+    BotCommand('set_template', 'Update reminder message'),
+    BotCommand('add_manager', 'Add a new manager'),
+    BotCommand('remove_manager', 'Remove a manager'),
+    BotCommand('managers', 'List active managers'),
+]
+
+GROUP_CHAT_COMMANDS = [
+    BotCommand('register', 'Register this Telegram group'),
+    BotCommand('my_id', 'Show your Telegram user ID'),
+    BotCommand('start', 'Start the bot')
+]
+
+
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(PRIVATE_CHAT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    await application.bot.set_my_commands(GROUP_CHAT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+
+
 def build_application() -> Application:
     init_db()
 
-    application = ApplicationBuilder().token(settings.telegram_bot_token).build()
+    application = ApplicationBuilder().token(settings.telegram_bot_token).post_init(post_init).build()
 
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('help', help_command))
@@ -538,6 +759,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler('send_reminder_powerplay', send_reminder_powerplay))
     application.add_handler(CommandHandler('send_reminder_viking', send_reminder_viking))
     application.add_handler(CommandHandler('send_custom', send_custom))
+    application.add_handler(CommandHandler('send_pick', send_pick))
+    application.add_handler(CallbackQueryHandler(picker_callback, pattern=r'^pk:'))
     application.add_handler(CommandHandler('confirm_send', confirm_send))
     application.add_handler(CommandHandler('cancel_send', cancel_send))
     application.add_handler(CommandHandler('status_today', status_today_command))

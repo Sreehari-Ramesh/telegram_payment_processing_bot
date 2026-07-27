@@ -13,7 +13,7 @@ templated or custom text reminders to Telegram groups.
 - Manual broadcast trigger from a manager's phone, gated by a confirmation step
 - Category-wise sending: B2B, B2C, Powerplay, Viking
 - One-off **custom** messages targeted at all groups, one category, one group, or a specific list
-  of groups
+  of groups — either by typing codes, or via a tappable inline-button checklist (`/send_pick`)
 - Time-sensitive greeting (`{greeting}`) — resolves to "Good morning"/"Good afternoon"/"Good
   evening" for manager-initiated sends, always "Good morning" for the automatic daily send
 - Pause/resume individual groups
@@ -110,6 +110,7 @@ All manager commands are used in a **private chat** with the bot (not inside a g
 | `/send_custom <category> <message>` | manager | One-off custom message to one **category** |
 | `/send_custom <group_code> <message>` | manager | One-off custom message to a single **group** |
 | `/send_custom <code1,code2,...> <message>` | manager | One-off custom message to a specific **list of groups** |
+| `/send_pick <message>` | manager | Interactive checklist — tap groups on/off instead of typing codes |
 | `/confirm_send <code>` | manager | Confirms and fires a pending broadcast |
 | `/cancel_send <code>` | manager | Cancels a pending broadcast |
 | `/status_today` | manager | Today's send counts by status + active group counts |
@@ -141,6 +142,24 @@ The first word after the command is checked in this order:
 
 If your message must literally start with a word that happens to match a category name or a
 registered group code, prefix it with `all` to avoid ambiguity.
+
+### `/send_pick` — interactive group picker
+
+For picking a handful of groups out of many, `/send_pick <message>` is usually faster than typing
+a comma list:
+
+```text
+/send_pick Reminder: please clear your dues.
+```
+
+The bot replies with a paginated, tappable checklist (⬜/✅ per group, 8 per page, with Prev/Next,
+Select all, and Clear all). Tap **Continue** once you're done selecting, then **Confirm & Send** on
+the preview that follows — no typing group codes or a `/confirm_send` code required, it's all
+button taps. Under the hood it uses the same confirmation record as the text-based flow, so the
+generated code still works with `/confirm_send <code>` too if you prefer finishing that way.
+
+The picker state lives in memory only (not the database) — if the bot restarts mid-selection, the
+session is lost and you'll need to run `/send_pick` again.
 
 ### Edit the daily reminder template
 
